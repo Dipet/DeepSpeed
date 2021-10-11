@@ -393,9 +393,14 @@ class FP16_UnfusedOptimizer(object):
     def initialize_optimizer_states(self):
         for i, group in enumerate(self.fp16_groups):
             for param in group:
-                param.grad = torch.zeros(param.size(),
-                                         dtype=param.dtype,
-                                         device=torch.cuda.current_device())
+                if getattr(param, "to_sparse_optimizer", False):
+                    param.grad = torch.sparse_coo_tensor(
+                        [[0], [0]], [0], param.size(), dtype=param.dtype, device=torch.cuda.current_device()
+                    )
+                else:
+                    param.grad = torch.zeros(param.size(),
+                                             dtype=param.dtype,
+                                             device=torch.cuda.current_device())
 
         for i, group in enumerate(self.fp32_groups):
             for param in group:
