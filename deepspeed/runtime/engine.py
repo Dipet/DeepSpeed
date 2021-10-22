@@ -543,6 +543,9 @@ class DeepSpeedEngine(Module):
     def allreduce_always_fp32(self):
         return self._config.allreduce_always_fp32
 
+    def allreduce_always_fp16(self):
+        return self._config.allreduce_always_fp16
+
     def postscale_gradients(self):
         return not self._config.prescale_gradients
 
@@ -1692,10 +1695,12 @@ class DeepSpeedEngine(Module):
     def allreduce_bucket(self, bucket, dp_group):
         tensor = self.flatten(bucket)
 
-        tensor_to_allreduce = tensor
+        tensor_to_allreduce = tensor.half()
 
         if self.allreduce_always_fp32():
             tensor_to_allreduce = tensor.float()
+        elif self.allreduce_always_fp16():
+            tensor_to_allreduce = tensor.half()
 
         if self.postscale_gradients():
             if self.gradient_predivide_factor() != 1.0:
@@ -1708,18 +1713,18 @@ class DeepSpeedEngine(Module):
                     tensor_to_allreduce.mul_(self.gradient_predivide_factor() /
                                              dist.get_world_size(group=dp_group))
         else:
-            tensor_to_allreduce.div_(dist.get_world_size(group=dp_group))
+            tensor_to_allreduce.mul_(1.0 / dist.get_world_size(group=dp_group))
             dist.all_reduce(tensor_to_allreduce, group=dp_group)
 
-        if self.allreduce_always_fp32() and tensor is not tensor_to_allreduce:
-            tensor.copy_(tensor_to_allreduce)
+        if (self.allreduce_always_fp32() or self.allreduce_always_fp16()) and tensor is not tensor_to_allreduce:
+            tensor.data = tensor_to_allreduce.data
 
         return tensor
 
     def allreduce_and_copy(self, small_bucket, dp_group):
         allreduced = self.allreduce_bucket(small_bucket, dp_group)
         for buf, synced in zip(small_bucket, self.unflatten(allreduced, small_bucket)):
-            buf.copy_(synced)
+            buf.data = synced.data
 
     def allreduce_no_retain(self, bucket, dp_group, numel_per_bucket=500000000):
         small_bucket = []
@@ -1817,15 +1822,24 @@ class DeepSpeedEngine(Module):
         # Pre-divide for fp16 stability
         sparse.values.mul_(1.0 / dist.get_world_size(group=dp_group))
 
-        indices_device_list = self.sparse_all_gather(sparse.indices, dp_group)
-        values_device_list = self.sparse_all_gather(sparse.values, dp_group)
+        indices = sparse.indices
+        values = sparse.values
 
-        sparse.indices = torch.cat(indices_device_list)
-        sparse.values = torch.cat(values_device_list)
+        if self.allreduce_always_fp32():
+            values = values.float()
+        elif self.allreduce_always_fp16():
+            indices = indices.int()
+            values = values.half()
+
+        indices_device_list = self.sparse_all_gather(indices, dp_group)
+        values_device_list = self.sparse_all_gather(values, dp_group)
+
+        sparse.indices = torch.cat(indices_device_list).to(sparse.indices.dtype)
+        sparse.values = torch.cat(values_device_list).to(sparse.values.dtype)
         return sparse
 
     def sparse_all_gather(self, value, dp_group):
-        my_size = torch.LongTensor([value.size()[0]]).to(self.device)
+        my_size = torch.tensor([value.size()[0]], device=self.device, dtype=torch.long)
         all_sizes = self.all_gather_scalar(my_size, dp_group)
         max_size = torch.cat(all_sizes).max()
         fill_size = (max_size - my_size)
@@ -1833,16 +1847,16 @@ class DeepSpeedEngine(Module):
         assert value.dim() in [1, 2]
         if value.dim() == 1:
             if fill_size > 0:
-                value = torch.cat([value, value.new_zeros(fill_size)])
+                value = torch.cat([value, value.new_empty(fill_size)])
             tensor_list = [
-                value.new_zeros(max_size)
+                value.new_empty(max_size)
                 for _ in range(dist.get_world_size(group=dp_group))
             ]
         else:
             if fill_size > 0:
-                value = torch.cat([value, value.new_zeros(fill_size, value.size()[1])])
+                value = torch.cat([value, value.new_empty(fill_size, value.size()[1])])
             tensor_list = [
-                value.new_zeros(max_size,
+                value.new_empty(max_size,
                                 value.size()[1])
                 for _ in range(dist.get_world_size(group=dp_group))
             ]
@@ -1851,9 +1865,10 @@ class DeepSpeedEngine(Module):
         tensors = []
         for dev_idx, t in enumerate(tensor_list):
             size = all_sizes[dev_idx][0]
-            tensors.append(
-                t.index_select(0, torch.arange(size, dtype=torch.long, device=self.device))
-            )
+            if size == max_size:
+                tensors.append(t)
+            else:
+                tensors.append(t[:size])
 
         return tensors
 
