@@ -1766,7 +1766,7 @@ class DeepSpeedEngine(Module):
     def allreduce_and_copy(self, small_bucket, dp_group):
         allreduced = self.allreduce_bucket(small_bucket, dp_group)
         for buf, synced in zip(small_bucket, self.unflatten(allreduced, small_bucket)):
-            buf.data = synced.data
+            buf.copy_(synced.data)
 
     def allreduce_no_retain(self, bucket, dp_group, numel_per_bucket=500000000):
         small_bucket = []
