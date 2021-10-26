@@ -56,6 +56,7 @@ from .utils import ensure_directory_exists
 from ..ops.op_builder import UtilsBuilder
 from ..ops.adam import DeepSpeedCPUAdam
 from ..ops.adam import FusedAdam
+from ..moe.sharded_moe import TopKGate, MOELayer
 from ..moe.layer import MoE
 from ..git_version_info import version
 
@@ -145,6 +146,8 @@ class DeepSpeedEngine(Module):
         self.dist_backend = "nccl"
         self.has_moe_layers = False
         self.num_experts = None
+        self.gate_modules = []
+        self.moe_layers = []
         self._step_applied = False
         self._global_grad_norm = None
 
@@ -229,7 +232,9 @@ class DeepSpeedEngine(Module):
                 if self.sparse_gradients_enabled() or module.sparse:
                     self.sparse_tensor_module_names.add(name + ".weight")
                     if self.sparse_gradients_enabled():
-                        logger.info("Will convert {} to sparse tensor during training".format(name))
+                        logger.info(
+                            "Will convert {} to sparse tensor during training".format(
+                                name))
 
         self.save_non_zero_checkpoint = False
         self.save_zero_checkpoint = False
@@ -543,9 +548,6 @@ class DeepSpeedEngine(Module):
     def allreduce_always_fp32(self):
         return self._config.allreduce_always_fp32
 
-    def allreduce_always_fp16(self):
-        return self._config.allreduce_always_fp16
-
     def postscale_gradients(self):
         return not self._config.prescale_gradients
 
@@ -780,6 +782,17 @@ class DeepSpeedEngine(Module):
                 self.has_moe_layers = True
                 self.num_experts = module.num_experts
                 break
+
+        if self.has_moe_layers:
+            for _, module in self.module.named_modules():
+                if isinstance(module, TopKGate):
+                    self.gate_modules.append(module)
+                    if self.wall_clock_breakdown:
+                        module.wall_clock_breakdown = True
+                if isinstance(module, MOELayer):
+                    self.moe_layers.append(module)
+                    if self.wall_clock_breakdown:
+                        module.wall_clock_breakdown = True
 
         if not self.pipeline_parallelism:
             # PipeEngine's mpu object is different from Megatron's mpu object
@@ -1284,7 +1297,6 @@ class DeepSpeedEngine(Module):
 
     def forward(self, *inputs, **kwargs):
         r"""Execute forward propagation
-
         Arguments:
             *inputs: Variable length input list
             **kwargs: variable length keyword arguments
@@ -1350,6 +1362,29 @@ class DeepSpeedEngine(Module):
             self.flops_profiler.end_profile()
 
         return loss
+
+    def print_forward_breakdown(self, fwd_time):
+        gate_time = 0.0
+        moe_time = 0.0
+        falltoall = 0.0
+        salltoall = 0.0
+
+        for gate in self.gate_modules:
+            #logger.info(f"Individual TopK gate time: {gate.gate_time:.2f} ms")
+            gate_time += gate.gate_time
+
+        for l in self.moe_layers:
+            #logger.info(f"MoE layer; total: {l.time_moe:.2f} ms, first alltoall: {l.time_falltoall:.2f}, second alltoall: {l.time_salltoall:.2f}")
+            moe_time += l.time_moe
+            falltoall += l.time_falltoall
+            salltoall += l.time_salltoall
+
+        #TODO: Allreduce/average them across ranks for more accurate timing.
+
+        #if torch.distributed.get_rank() == 0:
+        log_dist(
+            f"rank={torch.distributed.get_rank()} time (ms) | forward: {fwd_time:.2f} (forward_moe: {moe_time:.2f}, 1st alltoall: {falltoall:.2f}, 2nd alltoall: {salltoall:.2f}, top-k: {gate_time:.2f})",
+            ranks=[0])
 
     def allreduce_gradients(self, bucket_size=MEMORY_OPT_ALLREDUCE_SIZE):
         # Pass (PP) gas boundary flag to optimizer (required for zero)
@@ -1646,6 +1681,7 @@ class DeepSpeedEngine(Module):
                         self.summary_writer.flush()
 
             if self.wall_clock_breakdown():
+                fwd_time = self.timers('forward').elapsed(reset=False) * 1000
                 self.timers.log([
                     'forward',
                     'backward',
@@ -1654,6 +1690,8 @@ class DeepSpeedEngine(Module):
                     'step'
                 ],
                                 reset=False)
+                if self.has_moe_layers:
+                    self.print_forward_breakdown(fwd_time=fwd_time)
 
         self.micro_steps += 1
 
@@ -1695,7 +1733,7 @@ class DeepSpeedEngine(Module):
     def allreduce_bucket(self, bucket, dp_group):
         tensor = self.flatten(bucket)
 
-        tensor_to_allreduce = tensor.half()
+        tensor_to_allreduce = tensor
 
         if self.allreduce_always_fp32():
             tensor_to_allreduce = tensor.float()
@@ -1716,7 +1754,8 @@ class DeepSpeedEngine(Module):
             tensor_to_allreduce.mul_(1.0 / dist.get_world_size(group=dp_group))
             dist.all_reduce(tensor_to_allreduce, group=dp_group)
 
-        if (self.allreduce_always_fp32() or self.allreduce_always_fp16()) and tensor is not tensor_to_allreduce:
+        if (self.allreduce_always_fp32()
+                or self.allreduce_always_fp16()) and tensor is not tensor_to_allreduce:
             tensor.data = tensor_to_allreduce.data
 
         return tensor
@@ -1794,8 +1833,9 @@ class DeepSpeedEngine(Module):
             for i, bucket_tuple in enumerate(expert_split_buckets):
                 bucket_type, bucket = bucket_tuple
                 if bucket_type == SparseTensor.type():
-                    self.sparse_allreduce_no_retain(bucket,
-                                                 groups.get_expert_data_parallel_group())
+                    self.sparse_allreduce_no_retain(
+                        bucket,
+                        groups.get_expert_data_parallel_group())
                 else:
                     # Separate between diff groups
                     self.allreduce_no_retain(
@@ -1822,24 +1862,15 @@ class DeepSpeedEngine(Module):
         # Pre-divide for fp16 stability
         sparse.values.mul_(1.0 / dist.get_world_size(group=dp_group))
 
-        indices = sparse.indices
-        values = sparse.values
+        indices_device_list = self.sparse_all_gather(sparse.indices, dp_group)
+        values_device_list = self.sparse_all_gather(sparse.values, dp_group)
 
-        if self.allreduce_always_fp32():
-            values = values.float()
-        elif self.allreduce_always_fp16():
-            indices = indices.int()
-            values = values.half()
-
-        indices_device_list = self.sparse_all_gather(indices, dp_group)
-        values_device_list = self.sparse_all_gather(values, dp_group)
-
-        sparse.indices = torch.cat(indices_device_list).to(sparse.indices.dtype)
-        sparse.values = torch.cat(values_device_list).to(sparse.values.dtype)
+        sparse.indices = torch.cat(indices_device_list)
+        sparse.values = torch.cat(values_device_list)
         return sparse
 
     def sparse_all_gather(self, value, dp_group):
-        my_size = torch.tensor([value.size()[0]], device=self.device, dtype=torch.long)
+        my_size = torch.LongTensor([value.size()[0]]).to(self.device)
         all_sizes = self.all_gather_scalar(my_size, dp_group)
         max_size = torch.cat(all_sizes).max()
         fill_size = (max_size - my_size)
@@ -1865,10 +1896,11 @@ class DeepSpeedEngine(Module):
         tensors = []
         for dev_idx, t in enumerate(tensor_list):
             size = all_sizes[dev_idx][0]
-            if size == max_size:
-                tensors.append(t)
-            else:
-                tensors.append(t[:size])
+            tensors.append(
+                t.index_select(0,
+                               torch.arange(size,
+                                            dtype=torch.long,
+                                            device=self.device)))
 
         return tensors
 
@@ -1988,6 +2020,11 @@ class DeepSpeedEngine(Module):
             *``load_path``: Path of the loaded checkpoint. ``None`` if loading the checkpoint failed.
 
             *``client_state``: State dictionary used for loading required training states in the client code.
+
+        Important: under ZeRO3, one cannot load checkpoint with ``engine.load_checkpoint()`` right
+        after ``engine.save_checkpoint()``. It is because ``engine.module`` is partitioned, and
+        ``load_checkpoint()`` wants a pristine model. If insisting to do so, please reinitialize engine
+        before ``load_checkpoint()``.
         """
 
         if tag is None:
