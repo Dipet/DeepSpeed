@@ -548,6 +548,9 @@ class DeepSpeedEngine(Module):
     def allreduce_always_fp32(self):
         return self._config.allreduce_always_fp32
 
+    def allreduce_always_fp16(self):
+        return self._config.allreduce_always_fp16
+
     def postscale_gradients(self):
         return not self._config.prescale_gradients
 
